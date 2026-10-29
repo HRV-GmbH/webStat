@@ -6,6 +6,7 @@ const zlib = require('zlib');
 const Client = require('ssh2-sftp-client');
 const crypto = require('crypto');
 const OpenAI = require('openai');
+const { createMonthlyReportPdf, summarizeDaily } = require('./report');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -52,6 +53,38 @@ function loadConfig() {
 }
 
 const config = loadConfig();
+
+// User-Agents von Skripten, Scannern und Diensten, die sich nicht "bot" nennen (leer/"-" eingeschlossen)
+const TOOL_UA_RE = /^-?$|python|curl|wget|go-http|java\/|okhttp|axios|node-fetch|undici|libwww|scrapy|headless|phantom|selenium|puppeteer|playwright|httpclient|aiohttp|httpx|bun\/|deno\/|zgrab|masscan|nikto|sqlmap|censys|expanse|netsystems|l9explore|l9tcpid|postman|guzzle|linkvalidator|skypeuripreview|uptime|pingdom|gtmetrix|lighthouse|facebookexternalhit|whatsapp|telegram/i;
+// Ein echter Browser lädt Stylesheets, Skripte, Bilder oder Schriften nach (favicon wird auch von Bots abgerufen)
+const BROWSER_ASSET_RE = /\.(css|js|mjs|png|jpe?g|gif|svg|webp|avif|ico|woff2?|ttf|eot|map|scss)$|\/_CGSmartImage\/|\/assets\//i;
+
+function isBrowserAsset(urlPath) {
+  return BROWSER_ASSET_RE.test(urlPath) && !/favicon|apple-touch-icon/i.test(urlPath);
+}
+
+// Einstufung allein am User-Agent: ai | bot | human (human = noch unbestätigt)
+function classifyUserAgent(uaRaw) {
+  const ua = (uaRaw || '').toLowerCase();
+
+  // AI-Clients priorisieren, falls sowohl "bot" als auch AI-Muster vorkommen
+  if (ua.includes('chatgpt') || ua.includes('gpt') || ua.includes('openai') || ua.includes('copilot') || ua.includes('oai-searchbot') || ua.includes('ai-')) {
+    return 'ai';
+  }
+
+  if (/bot|crawl|spider|searchbot|crawler/.test(ua) || TOOL_UA_RE.test(ua)) {
+    return 'bot';
+  }
+
+  return 'human';
+}
+
+// Bestätigt "human" bei Browser-Verhalten (Assets geladen oder mehrere Seiten), sonst "unclear"
+function resolveVisitorType(visitor, loadedBrowserAssets) {
+  if (visitor.type !== 'human') return visitor.type;
+  const pageCount = visitor.pages ? visitor.pages.size : 0;
+  return pageCount >= 2 || loadedBrowserAssets ? 'human' : 'unclear';
+}
 
 function loadDownloadMeta() {
   try {
@@ -470,23 +503,9 @@ async function computeDailyStatsForFile(fileName) {
     return `${yyyy}-${mon}-${dd}T${hh}:${mm}:${ss}${offH}:${offM}`;
   }
 
-  function classifyUserAgent(uaRaw) {
-    const ua = (uaRaw || '').toLowerCase();
-    if (!ua) return 'human';
-
-    if (ua.includes('chatgpt') || ua.includes('gpt') || ua.includes('openai') || ua.includes('copilot') || ua.includes('oai-searchbot') || ua.includes('ai-')) {
-      return 'ai';
-    }
-
-    if (/bot|crawl|spider|searchbot|crawler/.test(ua)) {
-      return 'bot';
-    }
-
-    return 'human';
-  }
-
   let totalLines = 0;
   const visitors = new Map();
+  const assetVisitors = new Set(); // Besucher, die Browser-Assets (auch 304) geladen haben
   const MAX_VISITORS = 2000;
   let firstDateIsoFull = null;
   let errors4xx = 0;
@@ -521,6 +540,13 @@ async function computeDailyStatsForFile(fileName) {
         errors429 += 1;
       }
 
+      // Browser-Assets merken, bevor 3xx/404 verworfen werden (Wiederkehrer erhalten 304)
+      const urlPathOnly = pathRequested.split('?')[0];
+      const assetRequest = isBrowserAsset(urlPathOnly);
+      if (assetRequest && (status === '200' || status === '304')) {
+        assetVisitors.add(`${ip}|${userAgent || ''}`);
+      }
+
       // Nur 200er für Besucherzählung berücksichtigen, 404/3xx ignorieren
       if (status !== '200') return;
 
@@ -548,6 +574,7 @@ async function computeDailyStatsForFile(fileName) {
           lastUrl: url,
           hits: 1,
           type: currentType,
+          pages: new Set(),
         };
       } else {
         visitor.lastTime = timeIso;
@@ -562,6 +589,7 @@ async function computeDailyStatsForFile(fileName) {
         }
       }
 
+      if (!assetRequest) visitor.pages.add(urlPathOnly);
       visitors.set(key, visitor);
     });
 
@@ -577,6 +605,7 @@ async function computeDailyStatsForFile(fileName) {
   let visitsBots = 0;
   let visitsAi = 0;
   let visitsHuman = 0;
+  let visitsUnclear = 0;
 
   function calcSessionsForVisitor(v) {
     if (!v.firstTime || !v.lastTime) return 1;
@@ -592,10 +621,13 @@ async function computeDailyStatsForFile(fileName) {
     const sessions = calcSessionsForVisitor(v);
     visitsTotal += sessions;
 
-    if (v.type === 'ai') {
+    const type = resolveVisitorType(v, assetVisitors.has(`${v.ip}|${v.userAgent || ''}`));
+    if (type === 'ai') {
       visitsAi += sessions;
-    } else if (v.type === 'bot') {
+    } else if (type === 'bot') {
       visitsBots += sessions;
+    } else if (type === 'unclear') {
+      visitsUnclear += sessions;
     } else {
       visitsHuman += sessions;
     }
@@ -611,6 +643,7 @@ async function computeDailyStatsForFile(fileName) {
     visitsBots,
     visitsAi,
     visitsHuman,
+    visitsUnclear,
     errors4xx,
     errors429,
   };
@@ -786,6 +819,7 @@ app.post('/extract', (req, res) => {
     let previewTruncated = false;
     let totalLines = 0;
     const visitors = new Map(); // key = IP+UA, Wert = zusammengefasste Daten
+    const assetVisitors = new Set(); // Besucher, die Browser-Assets (auch 304) geladen haben
     const MAX_VISITORS = 2000;
     let firstDateIsoFull = null; // frühester Zeitstempel als vollständige ISO-Zeit
 
@@ -807,22 +841,6 @@ app.post('/extract', (req, res) => {
       const offH = offset.slice(0, 3); // +02
       const offM = offset.slice(3);    // 00
       return `${yyyy}-${mon}-${dd}T${hh}:${mm}:${ss}${offH}:${offM}`;
-    }
-
-    function classifyUserAgent(uaRaw) {
-      const ua = (uaRaw || '').toLowerCase();
-      if (!ua) return 'human';
-
-      // AI-Clients priorisieren, falls sowohl "bot" als auch AI-Muster vorkommen
-      if (ua.includes('chatgpt') || ua.includes('gpt') || ua.includes('openai') || ua.includes('copilot') || ua.includes('oai-searchbot') || ua.includes('ai-')) {
-        return 'ai';
-      }
-
-      if (/bot|crawl|spider|searchbot|crawler/.test(ua)) {
-        return 'bot';
-      }
-
-      return 'human';
     }
 
     rl.on('line', (line) => {
@@ -852,6 +870,13 @@ app.post('/extract', (req, res) => {
       const status = match[5];
       const host = match[6];
       const userAgent = match[8];
+
+      // Browser-Assets merken, bevor 3xx/404 verworfen werden (Wiederkehrer erhalten 304)
+      const urlPathOnly = pathRequested.split('?')[0];
+      const assetRequest = isBrowserAsset(urlPathOnly);
+      if (assetRequest && (status === '200' || status === '304') && config.relevantDomains.includes(host)) {
+        assetVisitors.add(`${ip}|${userAgent || ''}`);
+      }
 
       // Nur 200er berücksichtigen, 404/3xx ignorieren
       if (status !== '200') return;
@@ -884,6 +909,7 @@ app.post('/extract', (req, res) => {
           lastUrl: url,
           hits: 1,
           type: currentType,
+          pages: new Set(),
         };
       } else {
         visitor.lastTime = timeIso;
@@ -899,6 +925,7 @@ app.post('/extract', (req, res) => {
         }
       }
 
+      if (!assetRequest) visitor.pages.add(urlPathOnly);
       visitors.set(key, visitor);
     });
 
@@ -911,6 +938,7 @@ app.post('/extract', (req, res) => {
         let visitsBots = 0;
         let visitsAi = 0;
         let visitsHuman = 0;
+        let visitsUnclear = 0;
 
         function calcSessionsForVisitor(v) {
           if (!v.firstTime || !v.lastTime) return 1;
@@ -926,10 +954,13 @@ app.post('/extract', (req, res) => {
           const sessions = calcSessionsForVisitor(v);
           visitsTotal += sessions;
 
+          v.type = resolveVisitorType(v, assetVisitors.has(`${v.ip}|${v.userAgent || ''}`));
           if (v.type === 'ai') {
             visitsAi += sessions;
           } else if (v.type === 'bot') {
             visitsBots += sessions;
+          } else if (v.type === 'unclear') {
+            visitsUnclear += sessions;
           } else {
             visitsHuman += sessions;
           }
@@ -946,8 +977,9 @@ app.post('/extract', (req, res) => {
           visitsBots,
           visitsAi,
           visitsHuman,
+          visitsUnclear,
           firstDateIso,
-          entries,
+          entries: entries.map(({ pages, ...visitor }) => visitor),
         });
       } catch (error) {
         console.error('Fehler bei der Analyse der entpackten Datei:', error);
@@ -1052,6 +1084,7 @@ app.get('/daily-stats-last30', (req, res) => {
         lineCountApprox: s.lineCountApprox || 0,
         visitsTotal: s.visitsTotal || 0,
         visitsHuman: s.visitsHuman || 0,
+        visitsUnclear: s.visitsUnclear || 0,
         visitsBots: s.visitsBots || 0,
         visitsAi: s.visitsAi || 0,
         errors4xx: s.errors4xx || 0,
@@ -1094,40 +1127,7 @@ app.get('/top-referrers', (req, res) => {
       return res.json({ success: true, referrers: [] });
     }
 
-    const logRegex = /^(\S+)\s+\S+\s+\S+\s+\[([^\]]+)\]\s+"(\S+)\s+([^\"]+)\s+\S+"\s+(\d{3})\s+\S+\s+(\S+)\s+"([^\"]*)"\s+"([^\"]*)"/;
-    const referrerCounts = new Map();
-
-    for (const fileName of logFiles) {
-      const sourcePath = path.join(extractedDirectory, fileName);
-      const lines = fs.readFileSync(sourcePath, 'utf8').split('\n');
-
-      for (const line of lines) {
-        const match = logRegex.exec(line);
-        if (!match) continue;
-
-        const status = match[5];
-        const host = match[6];
-        const referrer = match[7];
-
-        // Nur 200er berücksichtigen
-        if (status !== '200') continue;
-
-        // Nur relevante Domains berücksichtigen
-        if (!config.relevantDomains.includes(host)) continue;
-
-        // Leere, "-" oder interne Referrer ignorieren (interne = relevante Domains)
-        if (!referrer || referrer === '-') continue;
-        if (config.relevantDomains.some((d) => referrer.includes(d))) continue;
-
-        const count = referrerCounts.get(referrer) || 0;
-        referrerCounts.set(referrer, count + 1);
-      }
-    }
-
-    const sorted = Array.from(referrerCounts.entries())
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 15)
-      .map(([url, count]) => ({ url, count }));
+    const sorted = collectTopReferrers(logFiles, 15);
 
     res.json({
       success: true,
@@ -1143,11 +1143,259 @@ app.get('/top-referrers', (req, res) => {
   }
 });
 
-// KI-Analyse der letzten 90 Tage via GitHub Models (gpt-4o-mini)
+// Gespeicherte Analysen: downloads/analyses/<typ>-YYYY-MM-DD.md (gleicher Tag wird überschrieben)
+const analysesDirectory = path.join(localDirectory, 'analyses');
+const ANALYSIS_TYPES = {
+  'ai-analyze': '90-Tage-Analyse',
+  'ai-analyze-raw': 'Analyse der Rohdaten',
+  'ai-bot-analyze': 'KI-Zugriffe & GEO-Analyse',
+};
+
+function localDateString(d = new Date()) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// Titel und Erstelldatum, die jeder Analyse vorangestellt werden
+function analysisHeader(type) {
+  const now = new Date();
+  return `# ${ANALYSIS_TYPES[type]} – ${localDateString(now)}\n\nErstellt: ${now.toLocaleString('de-DE')}\n\n`;
+}
+
+function saveAnalysis(type, content) {
+  fs.mkdirSync(analysesDirectory, { recursive: true });
+  const fileName = `${type}-${localDateString()}.md`;
+  fs.writeFileSync(path.join(analysesDirectory, fileName), content, 'utf8');
+  return fileName;
+}
+
+// Reicht den Modell-Stream an den Client durch und speichert das fertige Ergebnis
+async function relayStreamAndSave(res, stream, type, preamble = '') {
+  const prefix = analysisHeader(type) + preamble;
+  res.write(`data: ${JSON.stringify({ prefix })}\n\n`);
+  let text = '';
+  for await (const chunk of stream) {
+    const piece = chunk.choices[0]?.delta?.content ?? '';
+    if (piece) {
+      text += piece;
+      res.write(`data: ${JSON.stringify({ text: piece })}\n\n`);
+    }
+  }
+  const saved = text.trim() ? saveAnalysis(type, `${prefix}${text}\n`) : null;
+  res.write(`data: ${JSON.stringify({ done: true, saved })}\n\n`);
+  res.end();
+}
+
+// Liefert die zuletzt gespeicherte Analyse eines Typs
+app.get('/analyses/latest', (req, res) => {
+  const type = String(req.query.type || '');
+  if (!Object.prototype.hasOwnProperty.call(ANALYSIS_TYPES, type)) {
+    return res.status(400).json({ success: false, error: 'Unbekannter Analyse-Typ.' });
+  }
+  const fileRegex = new RegExp(`^${type}-(\\d{4}-\\d{2}-\\d{2})\\.md$`);
+  const files = fs.existsSync(analysesDirectory)
+    ? fs.readdirSync(analysesDirectory).filter((n) => fileRegex.test(n)).sort()
+    : [];
+  if (!files.length) {
+    return res.json({ success: true, found: false });
+  }
+  const file = files[files.length - 1];
+  res.json({
+    success: true,
+    found: true,
+    file,
+    date: fileRegex.exec(file)[1],
+    content: fs.readFileSync(path.join(analysesDirectory, file), 'utf8'),
+  });
+});
+
+function statsToMarkdown(stats) {
+  const labels = { training: 'Training', search: 'KI-Suche', user: 'Nutzeranfrage', ads: 'Werbeprüfung', unbekannt: 'unbekannt' };
+  const cell = (v) => String(v).replace(/\|/g, '\\|');
+  const table = (headers, rows) =>
+    [`| ${headers.join(' | ')} |`, `| ${headers.map(() => '---').join(' | ')} |`, ...rows.map((r) => `| ${r.map(cell).join(' | ')} |`)].join('\n');
+
+  const purposes = Object.entries(stats.byPurpose).map(([k, v]) => `${labels[k] || k}: ${v}`).join(' | ');
+  const parts = [
+    `Zeitraum ${stats.period.from} bis ${stats.period.to}: ${stats.totalAiHits} KI-Zugriffe von ${stats.totalPageRequests} Seitenaufrufen (${stats.aiSharePercent} %)` +
+      (purposes ? ` – ${purposes}` : ''),
+    '## KI-Crawler',
+    table(
+      ['Crawler', 'Anbieter', 'Zweck', 'Zugriffe', '2xx', '3xx', '404', 'Sonst. Fehler', 'robots/llms/sitemap'],
+      stats.bots.map((b) => [
+        b.name, b.vendor, labels[b.purpose] || b.purpose, b.hits, b.ok, b.redirects, b.notFound, b.otherErrors,
+        Object.entries(b.special).map(([p, n]) => `${p}: ${n}`).join(', ') || '-',
+      ])
+    ),
+    '## Von KI am häufigsten abgefragte Seiten',
+    table(['Pfad', 'Zugriffe', 'Crawler'], stats.topPages.map((p) => [p.path, p.hits, p.bots.join(', ')])),
+  ];
+  if (stats.notFoundPaths.length) {
+    parts.push('## Von KI abgefragte, nicht gefundene Pfade (404)');
+    parts.push(table(['Pfad', 'Zugriffe'], stats.notFoundPaths.map((p) => [p.path, p.hits])));
+  }
+  return parts.join('\n\n');
+}
+
+// Azure-OpenAI-Client (API-Key); Endpoint und Deployment stammen aus der .env
+function getAiConfig() {
+  const endpoint = (process.env.AZURE_OPENAI_ENDPOINT || '').replace(/\/+$/, '');
+  const apiKey = process.env.AZURE_OPENAI_API_KEY;
+  const deployment = process.env.AZURE_OPENAI_DEPLOYMENT;
+  if (!endpoint || !apiKey || !deployment) return null;
+  return {
+    client: new OpenAI({ baseURL: `${endpoint}/openai/v1/`, apiKey }),
+    model: deployment,
+  };
+}
+
+const AI_CONFIG_ERROR = 'AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY oder AZURE_OPENAI_DEPLOYMENT nicht konfiguriert.';
+
+// Prompt für die Tagesstatistik-Analyse (Standard: die letzten N Tage, Monatsbericht: ein Kalendermonat)
+function buildDailyStatsMessages(entries, periodLabel = `der letzten ${entries.length} Tage`) {
+  const statsJson = JSON.stringify(entries.map((d) => ({
+    date: d.date,
+    total: d.visitsTotal ?? 0,
+    human: d.visitsHuman ?? 0,
+    unclear: d.visitsUnclear ?? 0,
+    bot: d.visitsBots ?? 0,
+    ai: d.visitsAi ?? 0,
+  })));
+
+  return [
+    {
+      role: 'system',
+      content:
+        'Du bist ein Webanalyse-Experte. Du bekommst Tagesstatistiken einer Website als JSON mit den Feldern ' +
+        'date (Datum), total (Gesamtaufrufe), human (Besucher mit Browser-Verhalten), unclear (Besucher ohne erkennbares Browser-Verhalten, ' +
+        'vermutlich überwiegend getarnte Bots), bot (Bots), ai (KI-Crawler). ' +
+        'Analysiere die Daten auf Deutsch und berichte über: Trends bei menschlichen Besuchern, ' +
+        'Bot-Auffälligkeiten oder Angriffsmuster, KI-Crawler-Entwicklung, Wochentags-Muster, ' +
+        'besondere Ausreißer und konkrete Handlungsempfehlungen. Antworte strukturiert mit Überschriften.',
+    },
+    {
+      role: 'user',
+      content: `Hier sind die Tagesstatistiken ${periodLabel}:\n${statsJson}`,
+    },
+  ];
+}
+
+// Sampelt Apache-Logzeilen (logFiles: neueste zuerst) und baut den Rohdaten-Prompt
+function buildRawSampleMessages(logFiles) {
+  // Pro Datei max. 300 Zeilen sampeln – nur Einträge zwischen 10:00 und 16:00 Uhr
+  const SAMPLE_PER_FILE = 300;
+  const sampleLines = [];
+
+  // Apache-Zeitformat: [31/Mar/2026:14:23:01 +0200] → Stunde und Minute extrahieren
+  const timeInWindowRegex = /\[[\d]{2}\/\w+\/\d{4}:(\d{2}):(\d{2}):\d{2} [+\-]\d{4}\]/;
+
+  for (const name of logFiles) {
+    const fullPath = path.join(extractedDirectory, name);
+    const content = fs.readFileSync(fullPath, 'utf8');
+    const lines = content.split('\n').filter((line) => {
+      if (!line) return false;
+      // Nur Zeilen für www.hrv.de
+      if (!line.includes('www.hrv.de')) return false;
+      // Statische Ressourcen und Bilder ignorieren
+      if (/\.(ico|js|css|png|jpg|jpeg|gif|svg|webp|bmp|woff2?|ttf|eot)("| )/.test(line)) return false;
+      // HTTP-Statuscode extrahieren: nach "GET /pfad HTTP/1.1" folgt der Status
+      const statusMatch = /"\s+(\d{3})\s+/.exec(line);
+      if (statusMatch) {
+        const status = parseInt(statusMatch[1], 10);
+        // 3xx und 404 ignorieren
+        if (status >= 300 && status < 400) return false;
+        if (status === 404) return false;
+      }
+      // Zeitfenster 07:30–21:00
+      const m = timeInWindowRegex.exec(line);
+      if (!m) return false;
+      const totalMinutes = parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+      return totalMinutes >= 7 * 60 + 30 && totalMinutes < 21 * 60;
+    });
+    // Von hinten sampeln → neueste Einträge der Datei zuerst
+    const reversed = lines.slice().reverse();
+    const step = Math.max(1, Math.floor(reversed.length / SAMPLE_PER_FILE));
+    for (let i = 0; i < reversed.length && sampleLines.length < logFiles.length * SAMPLE_PER_FILE; i += step) {
+      sampleLines.push(reversed[i].replace(/\b(\d{1,3}\.\d{1,3}\.\d{1,3})\.0\b/g, '$1.*'));
+    }
+  }
+
+  // Token-Budget: 8000 gesamt – ca. 600 für System-/User-Prompt-Overhead → 7400 für Rohdaten
+  // Schätzung: 1 Token ≈ 4 Zeichen
+  const TOKEN_BUDGET = 7400;
+  let totalChars = 0;
+  const budgetedLines = [];
+  for (const line of sampleLines) {
+    const lineChars = line.length + 1; // +1 für '\n'
+    if (totalChars + lineChars > TOKEN_BUDGET * 4) break;
+    budgetedLines.push(line);
+    totalChars += lineChars;
+  }
+
+  const rawSample = budgetedLines.join('\n');
+  const actualDays = logFiles.length;
+  const dateFrom = logFiles[logFiles.length - 1].slice(7, 17);
+  const dateTo = logFiles[0].slice(7, 17);
+  const info = `Werte ${actualDays} Tag(e) aus (${dateFrom} bis ${dateTo}), ${budgetedLines.length} Log-Zeilen`;
+
+  return {
+    info,
+    messages: [
+      {
+        role: 'system',
+        content:
+          'Du bist ein Webanalyse-Experte. Du bekommst eine repräsentative Auswahl von Apache-Access-Log-Zeilen ' +
+          'des Auswertungszeitraums. Jede Zeile hat das Format: IP - - [Datum] "Methode Pfad Protokoll" Status Bytes Referer UserAgent. ' +
+          'Analysiere auf Deutsch und berichte über: ' +
+          '1) Häufigste aufgerufene Seiten/Pfade, ' +
+          '2) Auffällige IP-Adressen oder Angriffsmuster (z.B. viele 4xx-Fehler, Scanner), ' +
+          '3) HTTP-Statuscodes (Fehler 4xx/5xx häufig?), ' +
+          '4) Bot- und KI-Crawler-User-Agents, ' +
+          '5) Ungewöhnliche Anfragen oder Sicherheitshinweise, ' +
+          '6) Konkrete Handlungsempfehlungen. ' +
+          'Antworte strukturiert mit Überschriften.',
+      },
+      {
+        role: 'user',
+        content: `Analysiere diese ${budgetedLines.length} Apache-Log-Zeilen aus ${actualDays} Tagen (${dateFrom} bis ${dateTo}):\n\n${rawSample}`,
+      },
+    ],
+  };
+}
+
+// Prompt für die GEO-Analyse der aggregierten KI-Zugriffe
+function buildBotMessages(stats) {
+  return [
+    {
+      role: 'system',
+      content:
+        'Du bist Experte für Webanalyse und Generative Engine Optimization (GEO). Du bekommst aggregierte Zugriffsdaten ' +
+        'von KI-Crawlern und KI-Agenten auf eine Website (JSON). Felder: bots (je Crawler: purpose = training | search | user | ads | unbekannt, ' +
+        'hits, ok = HTTP 2xx, redirects, notFound, otherErrors, topPages, special = Abrufe von robots.txt/llms.txt/sitemap), ' +
+        'topPages (am häufigsten von KI abgefragte Seiten), topSections (Bereiche der Seite), notFoundPaths (von KI abgefragte, ' +
+        'nicht existierende Pfade), daily (KI-Zugriffe pro Tag), aiSharePercent (Anteil KI an allen Seitenaufrufen). ' +
+        'Antworte auf Deutsch, strukturiert mit Überschriften: ' +
+        '1) Überblick (Umfang, Anteil, Entwicklung, Verteilung nach Training/Suche/Nutzeranfrage), ' +
+        '2) Welche Crawler sind besonders aktiv und was bedeutet ihr Zweck, ' +
+        '3) Welche Seiten und Bereiche werden besonders häufig abgefragt und was lässt das über das Interesse der KI vermuten, ' +
+        '4) Auffälligkeiten (Fehler, 404er, Weiterleitungen, fehlende Abrufe von robots.txt/llms.txt; Abfragen sensibler Pfade wie ' +
+        '/.env gehören nicht zu GEO, sondern sind als Sicherheitshinweis/möglicher Scanner mit gefälschtem KI-User-Agent zu nennen), ' +
+        '5) Konkrete GEO-Empfehlungen, abgeleitet aus den Daten (z. B. Inhalte der meistgefragten Seiten ausbauen, ' +
+        'klare Frage-Antwort-Struktur, strukturierte Daten/schema.org, Aktualität, Fehlerseiten beheben, robots.txt und llms.txt ' +
+        'gezielt für Training vs. Suche steuern), priorisiert nach Wirkung. ' +
+        'Nutze nur Zahlen aus den Daten, erfinde keine Werte und kennzeichne Annahmen als solche.',
+    },
+    {
+      role: 'user',
+      content: `Zeitraum ${stats.period.from} bis ${stats.period.to}. Aggregierte KI-Zugriffe:\n${JSON.stringify(stats)}`,
+    },
+  ];
+}
+
+// KI-Analyse der letzten 90 Tage via Azure OpenAI
 app.post('/ai-analyze', async (req, res) => {
-  const token = process.env.GITHUB_TOKEN;
-  if (!token) {
-    return res.status(500).json({ success: false, error: 'GITHUB_TOKEN nicht konfiguriert.' });
+  const ai = getAiConfig();
+  if (!ai) {
+    return res.status(500).json({ success: false, error: AI_CONFIG_ERROR });
   }
 
   const dailyStats = loadDailyStats();
@@ -1160,53 +1408,19 @@ app.post('/ai-analyze', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Keine Tagesstatistiken vorhanden. Bitte zuerst Dateien herunterladen und analysieren.' });
   }
 
-  const statsJson = JSON.stringify(entries.map((d) => ({
-    date: d.date,
-    total: d.visitsTotal ?? 0,
-    human: d.visitsHuman ?? 0,
-    bot: d.visitsBots ?? 0,
-    ai: d.visitsAi ?? 0,
-  })));
-
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
 
   try {
-    const client = new OpenAI({
-      baseURL: 'https://models.inference.ai.azure.com',
-      apiKey: token,
-    });
-
-    const stream = await client.chat.completions.create({
-      model: 'gpt-4o-mini',
+    const stream = await ai.client.chat.completions.create({
+      model: ai.model,
       stream: true,
-      messages: [
-        {
-          role: 'system',
-          content:
-            'Du bist ein Webanalyse-Experte. Du bekommst Tagesstatistiken einer Website als JSON mit den Feldern ' +
-            'date (Datum), total (Gesamtaufrufe), human (menschliche Besucher), bot (Bots), ai (KI-Crawler). ' +
-            'Analysiere die Daten auf Deutsch und berichte über: Trends bei menschlichen Besuchern, ' +
-            'Bot-Auffälligkeiten oder Angriffsmuster, KI-Crawler-Entwicklung, Wochentags-Muster, ' +
-            'besondere Ausreißer und konkrete Handlungsempfehlungen. Antworte strukturiert mit Überschriften.',
-        },
-        {
-          role: 'user',
-          content: `Hier sind die Tagesstatistiken der letzten ${entries.length} Tage:\n${statsJson}`,
-        },
-      ],
+      messages: buildDailyStatsMessages(entries),
     });
 
-    for await (const chunk of stream) {
-      const text = chunk.choices[0]?.delta?.content ?? '';
-      if (text) {
-        res.write(`data: ${JSON.stringify({ text })}\n\n`);
-      }
-    }
-    res.write('data: {"done":true}\n\n');
-    res.end();
+    await relayStreamAndSave(res, stream, 'ai-analyze');
   } catch (err) {
     console.error('KI-Analyse Fehler:', err);
     res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
@@ -1216,9 +1430,9 @@ app.post('/ai-analyze', async (req, res) => {
 
 // KI-Analyse der Rohdaten der letzten 30 Tage (access-YYYY-MM-DD.log)
 app.post('/ai-analyze-raw', async (req, res) => {
-  const token = process.env.GITHUB_TOKEN;
-  if (!token) {
-    return res.status(500).json({ success: false, error: 'GITHUB_TOKEN nicht konfiguriert.' });
+  const ai = getAiConfig();
+  if (!ai) {
+    return res.status(500).json({ success: false, error: AI_CONFIG_ERROR });
   }
 
   if (!fs.existsSync(extractedDirectory)) {
@@ -1247,106 +1461,524 @@ app.post('/ai-analyze-raw', async (req, res) => {
   res.flushHeaders();
 
   try {
-    // Pro Datei max. 300 Zeilen sampeln – nur Einträge zwischen 10:00 und 16:00 Uhr
-    const SAMPLE_PER_FILE = 300;
-    const sampleLines = [];
+    const { messages, info: rawInfo } = buildRawSampleMessages(logFiles);
+    res.write(`data: ${JSON.stringify({ info: rawInfo })}\n\n`);
 
-    // Apache-Zeitformat: [31/Mar/2026:14:23:01 +0200] → Stunde und Minute extrahieren
-    const timeInWindowRegex = /\[[\d]{2}\/\w+\/\d{4}:(\d{2}):(\d{2}):\d{2} [+\-]\d{4}\]/;
-
-    for (const name of logFiles) {
-      const fullPath = path.join(extractedDirectory, name);
-      const content = fs.readFileSync(fullPath, 'utf8');
-      const lines = content.split('\n').filter((line) => {
-        if (!line) return false;
-        // Nur Zeilen für www.hrv.de
-        if (!line.includes('www.hrv.de')) return false;
-        // Statische Ressourcen und Bilder ignorieren
-        if (/\.(ico|js|css|png|jpg|jpeg|gif|svg|webp|bmp|woff2?|ttf|eot)("| )/.test(line)) return false;
-        // HTTP-Statuscode extrahieren: nach "GET /pfad HTTP/1.1" folgt der Status
-        const statusMatch = /"\s+(\d{3})\s+/.exec(line);
-        if (statusMatch) {
-          const status = parseInt(statusMatch[1], 10);
-          // 3xx und 404 ignorieren
-          if (status >= 300 && status < 400) return false;
-          if (status === 404) return false;
-        }
-        // Zeitfenster 07:30–21:00
-        const m = timeInWindowRegex.exec(line);
-        if (!m) return false;
-        const totalMinutes = parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
-        return totalMinutes >= 7 * 60 + 30 && totalMinutes < 21 * 60;
-      });
-      // Von hinten sampeln → neueste Einträge der Datei zuerst
-      const reversed = lines.slice().reverse();
-      const step = Math.max(1, Math.floor(reversed.length / SAMPLE_PER_FILE));
-      for (let i = 0; i < reversed.length && sampleLines.length < logFiles.length * SAMPLE_PER_FILE; i += step) {
-        sampleLines.push(reversed[i].replace(/\b(\d{1,3}\.\d{1,3}\.\d{1,3})\.0\b/g, '$1.*'));
-      }
-    }
-
-    // Token-Budget: 8000 gesamt – ca. 600 für System-/User-Prompt-Overhead → 7400 für Rohdaten
-    // Schätzung: 1 Token ≈ 4 Zeichen
-    const TOKEN_BUDGET = 7400;
-    let totalChars = 0;
-    const budgetedLines = [];
-    for (const line of sampleLines) {
-      const lineChars = line.length + 1; // +1 für '\n'
-      if (totalChars + lineChars > TOKEN_BUDGET * 4) break;
-      budgetedLines.push(line);
-      totalChars += lineChars;
-    }
-
-    const rawSample = budgetedLines.join('\n');
-    const actualDays = logFiles.length;
-    const dateFrom = logFiles[logFiles.length - 1].slice(7, 17);
-    const dateTo = logFiles[0].slice(7, 17);
-
-    res.write(`data: ${JSON.stringify({ info: `Werte ${actualDays} Tag(e) aus (${dateFrom} bis ${dateTo}), ${budgetedLines.length} Log-Zeilen` })}\n\n`);
-
-    const client = new OpenAI({
-      baseURL: 'https://models.inference.ai.azure.com',
-      apiKey: token,
-    });
-
-    const stream = await client.chat.completions.create({
-      model: 'gpt-4o-mini',
+    const stream = await ai.client.chat.completions.create({
+      model: ai.model,
       stream: true,
-      messages: [
-        {
-          role: 'system',
-          content:
-            'Du bist ein Webanalyse-Experte. Du bekommst eine repräsentative Auswahl von Apache-Access-Log-Zeilen ' +
-            'der letzten 30 Tage. Jede Zeile hat das Format: IP - - [Datum] "Methode Pfad Protokoll" Status Bytes Referer UserAgent. ' +
-            'Analysiere auf Deutsch und berichte über: ' +
-            '1) Häufigste aufgerufene Seiten/Pfade, ' +
-            '2) Auffällige IP-Adressen oder Angriffsmuster (z.B. viele 4xx-Fehler, Scanner), ' +
-            '3) HTTP-Statuscodes (Fehler 4xx/5xx häufig?), ' +
-            '4) Bot- und KI-Crawler-User-Agents, ' +
-            '5) Ungewöhnliche Anfragen oder Sicherheitshinweise, ' +
-            '6) Konkrete Handlungsempfehlungen. ' +
-            'Antworte strukturiert mit Überschriften.',
-        },
-        {
-          role: 'user',
-          content: `Analysiere diese ${budgetedLines.length} Apache-Log-Zeilen aus ${actualDays} Tagen (${dateFrom} bis ${dateTo}):\n\n${rawSample}`,
-        },
-      ],
+      messages,
     });
 
-    for await (const chunk of stream) {
-      const text = chunk.choices[0]?.delta?.content ?? '';
-      if (text) {
-        res.write(`data: ${JSON.stringify({ text })}\n\n`);
-      }
-    }
-    res.write('data: {"done":true}\n\n');
-    res.end();
+    await relayStreamAndSave(res, stream, 'ai-analyze-raw', `> ${rawInfo}\n\n`);
   } catch (err) {
     console.error('KI-Rohdaten-Analyse Fehler:', err);
     res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
     res.end();
   }
+});
+
+// Bekannte KI-Crawler/-Agenten; purpose: training (Modelltraining), search (KI-Suche/Index), user (durch Nutzerfrage ausgelöst), ads (Werbeprüfung)
+const AI_BOTS = [
+  { name: 'GPTBot', vendor: 'OpenAI', purpose: 'training', re: /gptbot/i },
+  { name: 'OAI-SearchBot', vendor: 'OpenAI', purpose: 'search', re: /oai-searchbot/i },
+  { name: 'ChatGPT-User', vendor: 'OpenAI', purpose: 'user', re: /chatgpt-user/i },
+  { name: 'ClaudeBot', vendor: 'Anthropic', purpose: 'training', re: /claudebot|anthropic-ai/i },
+  { name: 'Claude-SearchBot', vendor: 'Anthropic', purpose: 'search', re: /claude-searchbot/i },
+  { name: 'Claude-User', vendor: 'Anthropic', purpose: 'user', re: /claude-user/i },
+  { name: 'PerplexityBot', vendor: 'Perplexity', purpose: 'search', re: /perplexitybot/i },
+  { name: 'Perplexity-User', vendor: 'Perplexity', purpose: 'user', re: /perplexity-user/i },
+  { name: 'Google-Extended/GoogleOther', vendor: 'Google', purpose: 'training', re: /google-extended|googleother|google-cloudvertexbot/i },
+  { name: 'Meta-ExternalAgent', vendor: 'Meta', purpose: 'training', re: /meta-externalagent|meta-externalfetcher|facebookbot/i },
+  { name: 'Bytespider', vendor: 'ByteDance', purpose: 'training', re: /bytespider/i },
+  { name: 'CCBot', vendor: 'Common Crawl', purpose: 'training', re: /ccbot/i },
+  { name: 'Amazonbot', vendor: 'Amazon', purpose: 'search', re: /amazonbot/i },
+  { name: 'DuckAssistBot', vendor: 'DuckDuckGo', purpose: 'search', re: /duckassistbot/i },
+  { name: 'MistralAI-User', vendor: 'Mistral', purpose: 'user', re: /mistralai-user/i },
+  { name: 'Cohere', vendor: 'Cohere', purpose: 'training', re: /cohere-ai|cohere-training/i },
+  { name: 'Diffbot', vendor: 'Diffbot', purpose: 'training', re: /diffbot/i },
+  { name: 'YouBot', vendor: 'You.com', purpose: 'search', re: /youbot/i },
+  { name: 'AIWebIndex', vendor: 'Lyrenth', purpose: 'search', re: /aiwebindex/i },
+  { name: 'OAI-AdsBot', vendor: 'OpenAI', purpose: 'ads', re: /oai-adsbot/i },
+  { name: 'xAI-Grok', vendor: 'xAI', purpose: 'unbekannt', re: /xai-grok/i },
+];
+// Fallback analog zur Klassifizierung in den Tagesstatistiken
+const AI_GENERIC_RE = /chatgpt|gpt|openai|copilot|oai-searchbot|ai-/i;
+const STATIC_ASSET_RE = /\.(ico|js|css|png|jpg|jpeg|gif|svg|webp|bmp|woff2?|ttf|eot|map)$/i;
+const AI_SPECIAL_FILE_RE = /^\/(robots\.txt|llms(-full)?\.txt|sitemap[^/]*\.xml)$/i;
+
+function identifyAiBot(userAgent) {
+  const ua = userAgent || '';
+  const known = AI_BOTS.find((b) => b.re.test(ua));
+  if (known) return known;
+  if (AI_GENERIC_RE.test(ua)) return { name: 'Sonstige KI-Agenten', vendor: 'unbekannt', purpose: 'unbekannt' };
+  return null;
+}
+
+// Wertet alle übergebenen Logdateien (aufsteigend sortiert) auf KI-Zugriffe aus
+async function collectAiBotStats(logFiles) {
+  const readline = require('readline');
+  const logRegex = /^(\S+)\s+\S+\s+\S+\s+\[([^\]]+)\]\s+"(\S+)\s+([^\"]+)\s+\S+"\s+(\d{3})\s+\S+\s+(\S+)\s+"([^\"]*)"\s+"([^\"]*)"/;
+
+  const bots = new Map();
+  const pages = new Map();
+  const sections = new Map();
+  const notFound = new Map();
+  const daily = new Map();
+  let totalPageRequests = 0;
+  let totalAiHits = 0;
+
+  const top = (map, n) => Array.from(map.entries()).sort((a, b) => b[1] - a[1]).slice(0, n);
+
+  for (const name of logFiles) {
+    const date = name.slice(7, 17);
+    const rl = readline.createInterface({
+      input: fs.createReadStream(path.join(extractedDirectory, name), { encoding: 'utf8' }),
+      crlfDelay: Infinity,
+    });
+
+    for await (const line of rl) {
+      const m = logRegex.exec(line);
+      if (!m) continue;
+      const method = m[3];
+      const status = parseInt(m[5], 10);
+      const host = m[6];
+      if (!config.relevantDomains.includes(host)) continue;
+      if (method !== 'GET' && method !== 'HEAD') continue;
+
+      const urlPath = m[4].split('?')[0];
+      const isSpecial = AI_SPECIAL_FILE_RE.test(urlPath);
+      if (!isSpecial && STATIC_ASSET_RE.test(urlPath)) continue;
+      if (!isSpecial) totalPageRequests += 1;
+
+      const bot = identifyAiBot(m[8]);
+      if (!bot) continue;
+
+      let b = bots.get(bot.name);
+      if (!b) {
+        b = {
+          name: bot.name, vendor: bot.vendor, purpose: bot.purpose,
+          hits: 0, ok: 0, redirects: 0, notFound: 0, otherErrors: 0,
+          firstSeen: date, lastSeen: date, pages: new Map(), special: {},
+        };
+        bots.set(bot.name, b);
+      }
+      b.lastSeen = date;
+
+      if (isSpecial) {
+        b.special[urlPath] = (b.special[urlPath] || 0) + 1;
+        continue;
+      }
+
+      b.hits += 1;
+      totalAiHits += 1;
+      daily.set(date, (daily.get(date) || 0) + 1);
+
+      if (status >= 200 && status < 300) {
+        b.ok += 1;
+        b.pages.set(urlPath, (b.pages.get(urlPath) || 0) + 1);
+        const p = pages.get(urlPath) || { hits: 0, bots: new Set() };
+        p.hits += 1;
+        p.bots.add(bot.name);
+        pages.set(urlPath, p);
+        const section = '/' + (urlPath.split('/')[1] || '');
+        sections.set(section, (sections.get(section) || 0) + 1);
+      } else if (status >= 300 && status < 400) {
+        b.redirects += 1;
+      } else if (status === 404) {
+        b.notFound += 1;
+        notFound.set(urlPath, (notFound.get(urlPath) || 0) + 1);
+      } else {
+        b.otherErrors += 1;
+      }
+    }
+  }
+
+  const botList = Array.from(bots.values()).sort((a, b) => b.hits - a.hits);
+  const byPurpose = {};
+  for (const b of botList) byPurpose[b.purpose] = (byPurpose[b.purpose] || 0) + b.hits;
+
+  return {
+    totalPageRequests,
+    totalAiHits,
+    aiSharePercent: totalPageRequests ? Number(((totalAiHits / totalPageRequests) * 100).toFixed(2)) : 0,
+    byPurpose,
+    bots: botList.map((b) => ({
+      name: b.name, vendor: b.vendor, purpose: b.purpose,
+      hits: b.hits, ok: b.ok, redirects: b.redirects, notFound: b.notFound, otherErrors: b.otherErrors,
+      firstSeen: b.firstSeen, lastSeen: b.lastSeen, special: b.special,
+      topPages: top(b.pages, 8).map(([p, hits]) => ({ path: p, hits })),
+    })),
+    topPages: Array.from(pages.entries())
+      .sort((a, b) => b[1].hits - a[1].hits)
+      .slice(0, 25)
+      .map(([p, v]) => ({ path: p, hits: v.hits, bots: Array.from(v.bots) })),
+    topSections: top(sections, 10).map(([p, hits]) => ({ section: p, hits })),
+    notFoundPaths: top(notFound, 10).map(([p, hits]) => ({ path: p, hits })),
+    daily: Array.from(daily.entries()).sort((a, b) => a[0].localeCompare(b[0])).map(([date, hits]) => ({ date, hits })),
+  };
+}
+
+// Gesonderte Analyse der KI-Zugriffe der letzten 30 Tage inkl. GEO-Empfehlungen
+app.post('/ai-bot-analyze', async (req, res) => {
+  const ai = getAiConfig();
+  if (!ai) {
+    return res.status(500).json({ success: false, error: AI_CONFIG_ERROR });
+  }
+
+  if (!fs.existsSync(extractedDirectory)) {
+    return res.status(400).json({ success: false, error: 'Kein unzipped-Verzeichnis gefunden.' });
+  }
+
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - 30);
+  const cutoffStr = cutoff.toISOString().slice(0, 10);
+
+  const logFiles = fs.readdirSync(extractedDirectory)
+    .filter((name) => {
+      const m = /^access-(\d{4}-\d{2}-\d{2})\.log$/.exec(name);
+      return m && m[1] >= cutoffStr;
+    })
+    .sort();
+
+  if (!logFiles.length) {
+    return res.status(400).json({ success: false, error: 'Keine Log-Dateien der letzten 30 Tage gefunden.' });
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  try {
+    const stats = await collectAiBotStats(logFiles);
+    const dateFrom = logFiles[0].slice(7, 17);
+    const dateTo = logFiles[logFiles.length - 1].slice(7, 17);
+    stats.period = { from: dateFrom, to: dateTo, days: logFiles.length };
+
+    if (!stats.totalAiHits) {
+      res.write(`data: ${JSON.stringify({ error: 'Im Zeitraum wurden keine KI-Zugriffe gefunden.' })}\n\n`);
+      return res.end();
+    }
+
+    const stream = await ai.client.chat.completions.create({
+      model: ai.model,
+      stream: true,
+      messages: buildBotMessages(stats),
+    });
+
+    await relayStreamAndSave(res, stream, 'ai-bot-analyze', `${statsToMarkdown(stats)}\n\n---\n\n`);
+  } catch (err) {
+    console.error('KI-Zugriffsanalyse Fehler:', err);
+    res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+    res.end();
+  }
+});
+
+// ---------- Monatsbericht (PDF) ----------
+const reportsDirectory = path.join(localDirectory, 'reports');
+const MONTH_REGEX = /^\d{4}-(0[1-9]|1[0-2])$/;
+let reportInProgress = false;
+
+function reportFileName(month) {
+  return `webstat-monatsbericht-${month}.pdf`;
+}
+
+function monthLabel(month) {
+  return new Date(`${month}-15T12:00:00`).toLocaleDateString('de-DE', { month: 'long', year: 'numeric' });
+}
+
+// Logdateien eines Monats, aufsteigend nach Datum
+function monthLogFiles(month) {
+  if (!fs.existsSync(extractedDirectory)) return [];
+  return fs.readdirSync(extractedDirectory)
+    .filter((name) => {
+      const m = /^access-(\d{4}-\d{2})-\d{2}\.log$/.exec(name);
+      return m && m[1] === month;
+    })
+    .sort();
+}
+
+// Top-Referrer (externe Quellen, nur HTTP 200) aus den übergebenen Logdateien
+function collectTopReferrers(logFiles, limit) {
+  const logRegex = /^(\S+)\s+\S+\s+\S+\s+\[([^\]]+)\]\s+"(\S+)\s+([^\"]+)\s+\S+"\s+(\d{3})\s+\S+\s+(\S+)\s+"([^\"]*)"\s+"([^\"]*)"/;
+  const referrerCounts = new Map();
+
+  for (const fileName of logFiles) {
+    const lines = fs.readFileSync(path.join(extractedDirectory, fileName), 'utf8').split('\n');
+
+    for (const line of lines) {
+      const match = logRegex.exec(line);
+      if (!match) continue;
+
+      const status = match[5];
+      const host = match[6];
+      const referrer = match[7];
+
+      // Nur 200er berücksichtigen
+      if (status !== '200') continue;
+
+      // Nur relevante Domains berücksichtigen
+      if (!config.relevantDomains.includes(host)) continue;
+
+      // Leere, "-" oder interne Referrer ignorieren (interne = relevante Domains)
+      if (!referrer || referrer === '-') continue;
+      if (config.relevantDomains.some((d) => referrer.includes(d))) continue;
+
+      referrerCounts.set(referrer, (referrerCounts.get(referrer) || 0) + 1);
+    }
+  }
+
+  return Array.from(referrerCounts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([url, count]) => ({ url, count }));
+}
+
+// Verfügbare Monate (aus den Logdateien) samt Vollständigkeit und vorhandenem PDF
+function listReportMonths() {
+  const months = new Map();
+  if (fs.existsSync(extractedDirectory)) {
+    for (const name of fs.readdirSync(extractedDirectory)) {
+      const m = /^access-(\d{4}-\d{2})-\d{2}\.log$/.exec(name);
+      if (m) months.set(m[1], (months.get(m[1]) || 0) + 1);
+    }
+  }
+  const currentMonth = localDateString().slice(0, 7);
+
+  return Array.from(months.entries())
+    .sort((a, b) => b[0].localeCompare(a[0]))
+    .map(([month, days]) => {
+      const [year, mon] = month.split('-').map(Number);
+      const pdfPath = path.join(reportsDirectory, reportFileName(month));
+      const stat = fs.existsSync(pdfPath) ? fs.statSync(pdfPath) : null;
+      return {
+        month,
+        label: monthLabel(month),
+        days,
+        daysInMonth: new Date(year, mon, 0).getDate(),
+        isCurrentMonth: month === currentMonth,
+        pdf: stat ? { createdAt: stat.mtime.toISOString(), size: stat.size } : null,
+      };
+    });
+}
+
+// Monat vor dem übergebenen Monat (YYYY-MM)
+function previousMonth(month) {
+  const [year, mon] = month.split('-').map(Number);
+  const d = new Date(year, mon - 2, 1);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
+// Kennzahlen für den Laien-Artikel; Veränderungen werden hier berechnet, damit das Modell nicht rechnen muss
+function buildSummaryPayload({ label, coverage, daily, aiStats, previous, previousNote }) {
+  const describe = (days, cov, aiTotals) => {
+    const s = summarizeDaily(days);
+    const raw = {
+      besuche_gesamt: s.perDay.total,
+      browser_besucher: s.perDay.human,
+      unklar_vermutlich_bots: s.perDay.unclear,
+      bots: s.perDay.bots,
+      ki_crawler_besucher: s.perDay.ai,
+    };
+    if (aiTotals && aiTotals.totalAiHits) raw.ki_seitenabrufe = aiTotals.totalAiHits / cov.days;
+    return {
+      raw,
+      data: {
+        tage_mit_statistik: s.days,
+        tage_im_monat: cov.daysInMonth,
+        pro_tag: Object.fromEntries(Object.entries(raw).map(([key, value]) => [key, Math.round(value)])),
+        ...(aiTotals ? { ki_anteil_an_seitenabrufen_prozent: aiTotals.aiSharePercent } : {}),
+      },
+    };
+  };
+
+  const current = describe(daily, coverage, aiStats);
+  const payload = { monat: label, laufender_monat: coverage.isCurrentMonth, daten: current.data, vormonat: null, veraenderung_pro_tag_prozent: null };
+  if (previous) {
+    const prev = describe(previous.daily, previous.coverage, previous.aiTotals);
+    payload.vormonat = { monat: previous.monthLabel, ...prev.data };
+    // Gleiche Basis wie die Vergleichstabelle im PDF (ungerundete Tagesdurchschnitte)
+    payload.veraenderung_pro_tag_prozent = Object.fromEntries(
+      Object.keys(current.raw)
+        .filter((key) => prev.raw[key])
+        .map((key) => [key, Math.round(((current.raw[key] - prev.raw[key]) / prev.raw[key]) * 1000) / 10])
+    );
+  } else if (previousNote) {
+    payload.hinweis_vormonat = previousNote;
+  }
+  return payload;
+}
+
+// Kurzer, allgemeinverständlicher Artikel über den Monat (mit Vormonatsvergleich, falls vorhanden)
+function buildSummaryMessages(payload) {
+  return [
+    {
+      role: 'system',
+      content:
+        'Du schreibst für Geschäftsführer ohne technisches Vorwissen einen kurzen, gut lesbaren Artikel über die Besuche auf einer Website in einem Monat. ' +
+        'Regeln: Deutsch, Fließtext in 3 bis 4 kurzen Absätzen (insgesamt 150 bis 220 Wörter), keine Überschriften, keine Aufzählungen, keine Tabellen, keine Emojis. ' +
+        'Beginne mit der wichtigsten Aussage. Vermeide Fachbegriffe oder erkläre sie in einem Halbsatz ' +
+        '(Bot = automatisches Programm; KI-Crawler = Programm von KI-Anbietern, das Webseiten liest; ' +
+        '"unklar" = Besuche ohne erkennbares Browser-Verhalten, vermutlich überwiegend automatisierte Zugriffe). ' +
+        'Die Zahl der Besucher mit Browser-Verhalten ist die bestmögliche Schätzung echter Menschen; weise einmal darauf hin, dass es eine Schätzung ist. ' +
+        'Wenn ein Vormonat vorhanden ist, vergleiche anhand der Werte pro Tag (nicht der Monatssummen) und nenne zwei bis drei Zahlen mit der gelieferten Veränderung in Prozent. ' +
+        'Ist kein Vormonat vorhanden, erwähne das in einem Satz. Weise bei laufendem Monat oder Lücken in den Daten kurz darauf hin. ' +
+        'Liegt der Vormonat nur teilweise vor (tage_mit_statistik kleiner als tage_im_monat), sage ausdrücklich, dass der Vergleich nur eingeschränkt aussagekräftig ist. ' +
+        'Verwende ausschließlich gelieferte Zahlen, rechne nichts selbst nach und erfinde keine Ursachen; Vermutungen kennzeichnest du als solche. ' +
+        'Nenne höchstens fünf Zahlen, ohne Nachkommastellen, Prozentwerte auf ganze Zahlen gerundet ("etwa 15 %"), und sprich von Besuchen pro Tag. ' +
+        'Gehe nicht auf technische Fehlercodes ein. ' +
+        'Schließe mit einem Satz, was das für die Website bedeutet.',
+    },
+    { role: 'user', content: `Daten (JSON):\n${JSON.stringify(payload)}` },
+  ];
+}
+
+// Sammelt alle Daten eines Monats und führt die KI-Analysen für genau diesen Zeitraum aus
+async function buildMonthlyReportData(month, progress) {
+  const logFiles = monthLogFiles(month);
+  const [year, mon] = month.split('-').map(Number);
+  const label = monthLabel(month);
+  const from = logFiles[0].slice(7, 17);
+  const to = logFiles[logFiles.length - 1].slice(7, 17);
+
+  const allDaily = Object.values(loadDailyStats());
+  const monthDaily = (m) => allDaily
+    .filter((d) => d && d.date && d.date.startsWith(`${m}-`))
+    .sort((a, b) => a.date.localeCompare(b.date));
+  const daily = monthDaily(month);
+
+  progress('Werte Referrer aus…');
+  const referrers = collectTopReferrers(logFiles, 15);
+
+  progress('Werte KI-Zugriffe aus…');
+  const aiStats = await collectAiBotStats(logFiles);
+  aiStats.period = { from, to, days: logFiles.length };
+
+  // Vormonat für den Vergleich; nur mit Statistiken der aktuellen Klassifizierung vergleichbar
+  const prevMonth = previousMonth(month);
+  const prevLogFiles = monthLogFiles(prevMonth);
+  const prevDaily = monthDaily(prevMonth);
+  let previous = null;
+  let previousNote = null;
+  if (!prevDaily.length) {
+    previousNote = 'Für den Vormonat liegen keine Tagesstatistiken vor, ein Vergleich ist daher nicht möglich.';
+  } else if (prevDaily.some((d) => d.visitsUnclear === undefined)) {
+    previousNote = 'Die Tagesstatistik des Vormonats stammt aus einer älteren Klassifizierung und ist nicht vergleichbar. Bitte im Reiter "Statistik" die Tagesstatistiken neu berechnen.';
+  } else {
+    progress('Werte Vormonat aus…');
+    let aiTotals = null;
+    if (prevLogFiles.length) {
+      const s = await collectAiBotStats(prevLogFiles);
+      aiTotals = { totalAiHits: s.totalAiHits, totalPageRequests: s.totalPageRequests, aiSharePercent: s.aiSharePercent };
+    }
+    const [prevYear, prevMon] = prevMonth.split('-').map(Number);
+    previous = {
+      month: prevMonth,
+      monthLabel: monthLabel(prevMonth),
+      daily: prevDaily,
+      coverage: { days: prevLogFiles.length || prevDaily.length, daysInMonth: new Date(prevYear, prevMon, 0).getDate() },
+      aiTotals,
+    };
+  }
+
+  const coverage = {
+    from,
+    to,
+    days: logFiles.length,
+    daysInMonth: new Date(year, mon, 0).getDate(),
+    isCurrentMonth: month === localDateString().slice(0, 7),
+  };
+
+  const ai = getAiConfig();
+  const analyses = [];
+  const runAnalysis = async (key, title, unavailable, getMessages) => {
+    progress(`KI-Analyse: ${title}…`);
+    if (unavailable) return analyses.push({ key, error: unavailable });
+    if (!ai) return analyses.push({ key, error: AI_CONFIG_ERROR });
+    try {
+      const result = await ai.client.chat.completions.create({ model: ai.model, messages: getMessages() });
+      return analyses.push({ key, markdown: result.choices[0]?.message?.content || '' });
+    } catch (err) {
+      console.error(`Monatsbericht ${month}: KI-Analyse "${title}" fehlgeschlagen:`, err);
+      return analyses.push({ key, error: err.message });
+    }
+  };
+
+  await runAnalysis('summary', 'Zusammenfassung', daily.length ? null : 'Keine Tagesstatistiken für diesen Monat.',
+    () => buildSummaryMessages(buildSummaryPayload({ label, coverage, daily, aiStats, previous, previousNote })));
+  await runAnalysis('trend', 'Trendanalyse', daily.length ? null : 'Keine Tagesstatistiken für diesen Monat.',
+    () => buildDailyStatsMessages(daily, `des Monats ${label} (${daily.length} Tage)`));
+  await runAnalysis('raw', 'Rohdaten', null,
+    () => buildRawSampleMessages([...logFiles].reverse()).messages);
+  await runAnalysis('geo', 'GEO-Empfehlungen', aiStats.totalAiHits ? null : 'Keine KI-Zugriffe im Zeitraum.',
+    () => buildBotMessages(aiStats));
+
+  return {
+    month,
+    monthLabel: label,
+    sites: config.relevantDomains,
+    createdAt: new Date().toLocaleString('de-DE'),
+    model: ai ? ai.model : null,
+    coverage,
+    daily,
+    referrers,
+    aiStats,
+    previous,
+    previousNote,
+    analyses,
+  };
+}
+
+app.get('/reports/months', (req, res) => {
+  res.json({ success: true, months: listReportMonths() });
+});
+
+app.post('/reports/generate', async (req, res) => {
+  const month = String((req.body && req.body.month) || '');
+  if (!MONTH_REGEX.test(month) || !listReportMonths().some((m) => m.month === month)) {
+    return res.status(400).json({ success: false, error: 'Ungültiger oder nicht verfügbarer Monat.' });
+  }
+  if (reportInProgress) {
+    return res.status(409).json({ success: false, error: 'Es läuft bereits eine Berichtserstellung.' });
+  }
+  reportInProgress = true;
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+  const send = (event) => res.write(`data: ${JSON.stringify(event)}\n\n`);
+
+  try {
+    const data = await buildMonthlyReportData(month, (info) => send({ info }));
+    send({ info: 'Erzeuge PDF…' });
+    const buffer = await createMonthlyReportPdf(data);
+    fs.mkdirSync(reportsDirectory, { recursive: true });
+    fs.writeFileSync(path.join(reportsDirectory, reportFileName(month)), buffer);
+    send({ done: true, month });
+  } catch (err) {
+    console.error('Monatsbericht Fehler:', err);
+    send({ error: err.message });
+  } finally {
+    reportInProgress = false;
+    res.end();
+  }
+});
+
+app.get('/reports/download', (req, res) => {
+  const month = String(req.query.month || '');
+  if (!MONTH_REGEX.test(month)) {
+    return res.status(400).json({ success: false, error: 'Ungültiger Monat.' });
+  }
+  const filePath = path.join(reportsDirectory, reportFileName(month));
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ success: false, error: 'Für diesen Monat wurde noch kein PDF erstellt.' });
+  }
+  const disposition = req.query.inline === '1' ? 'inline' : 'attachment';
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `${disposition}; filename="${reportFileName(month)}"`);
+  res.sendFile(filePath);
 });
 
 app.listen(PORT, () => {

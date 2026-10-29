@@ -82,6 +82,175 @@ body.page-index .panel {
   border-radius: 4px;
   border: 1px solid #333;
 }
+body.page-index .app-header {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  margin-top: -2rem;
+  padding-top: 1rem;
+  background: #121212;
+}
+body.page-index .app-header h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.6rem;
+}
+body.page-index .tabs {
+  display: flex;
+  gap: 0.25rem;
+  margin-top: 0.75rem;
+  border-bottom: 1px solid #333;
+}
+body.page-index .tabs button.tab-btn {
+  padding: 0.6rem 1.25rem;
+  border: 1px solid #333;
+  border-bottom: none;
+  border-radius: 4px 4px 0 0;
+  background: #1e1e1e;
+  color: #aaaaaa;
+}
+body.page-index .tabs button.tab-btn.active {
+  border-color: #2453b3;
+  background: linear-gradient(135deg, #0b2a5b, #1f6feb);
+  color: #ffffff;
+}
+body.page-index .tab-content {
+  display: none;
+}
+body.page-index .tab-content.active {
+  display: block;
+}
+body.page-index .report-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+}
+body.page-index .report-table th {
+  padding: 6px 12px;
+  text-align: left;
+  color: #aaaaaa;
+  background: #2a2a2a;
+  border-bottom: 1px solid #444;
+}
+body.page-index .report-table td {
+  padding: 8px 12px;
+  border-bottom: 1px solid #2a2a2a;
+}
+body.page-index .report-table td.warn {
+  color: #e0a030;
+}
+body.page-index .report-table td.actions {
+  white-space: nowrap;
+}
+body.page-index .report-table td.actions a {
+  margin-left: 1rem;
+}
+body.page-index .report-table button {
+  padding: 0.35rem 0.9rem;
+  font-size: 0.85rem;
+}
+body.page-index .report-table a {
+  color: #8ab4f8;
+}
+body.page-index .analysis-status {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+  color: #888888;
+}
+body.page-index .analysis-result {
+  margin-top: 0.75rem;
+  padding: 0.75rem 1rem;
+  max-height: 75vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  line-height: 1.6;
+  background: #161616;
+  border: 1px solid #333;
+  border-radius: 4px;
+}
+body.page-index .analysis-result:empty {
+  display: none;
+}
+body.page-index .analysis-result.markdown {
+  white-space: normal;
+}
+body.page-index .markdown h1 {
+  margin: 0 0 0.5rem;
+  font-size: 1.4rem;
+  text-align: left;
+  color: #8ab4f8;
+}
+body.page-index .markdown h2 {
+  margin: 1.5rem 0 0.5rem;
+  padding-bottom: 0.25rem;
+  font-size: 1.15rem;
+  color: #7fb8c9;
+  border-bottom: 1px solid #2f4a63;
+}
+body.page-index .markdown h3,
+body.page-index .markdown h4 {
+  margin: 1.1rem 0 0.4rem;
+  font-size: 1rem;
+  color: #a9c4d4;
+}
+body.page-index .markdown p,
+body.page-index .markdown ul,
+body.page-index .markdown ol {
+  margin: 0.5rem 0;
+}
+body.page-index .markdown li {
+  margin: 0.2rem 0;
+}
+body.page-index .markdown code {
+  padding: 1px 5px;
+  font-family: ui-monospace, 'Cascadia Code', 'Consolas', monospace;
+  font-size: 0.9em;
+  background: #262626;
+  border-radius: 3px;
+}
+body.page-index .markdown pre {
+  padding: 0.75rem;
+  overflow-x: auto;
+  background: #0f0f0f;
+  border: 1px solid #333;
+  border-radius: 4px;
+}
+body.page-index .markdown pre code {
+  padding: 0;
+  background: none;
+}
+body.page-index .markdown blockquote {
+  margin: 0.5rem 0;
+  padding: 0.25rem 0.75rem;
+  color: #bbbbbb;
+  border-left: 3px solid #2453b3;
+}
+body.page-index .markdown hr {
+  margin: 1.25rem 0;
+  border: none;
+  border-top: 1px solid #333;
+}
+body.page-index .markdown table {
+  display: block;
+  max-width: 100%;
+  margin: 0.75rem 0;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+body.page-index .markdown th,
+body.page-index .markdown td {
+  padding: 4px 10px;
+  text-align: left;
+  border: 1px solid #333;
+}
+body.page-index .markdown th {
+  white-space: nowrap;
+  color: #aaaaaa;
+  background: #2a2a2a;
+}
+body.page-index .markdown tbody tr:nth-child(even) {
+  background: #1b1b1b;
+}
 body.page-index #fileList,
 body.page-index #unzippedList {
   margin-top: 0.5rem;

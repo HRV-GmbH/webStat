@@ -102,6 +102,9 @@
           if (typeof data.visitsHuman === 'number') {
             summary.push(`· Reguläre Besucher: ${data.visitsHuman}`);
           }
+          if (typeof data.visitsUnclear === 'number') {
+            summary.push(`· Unklar (ohne Browser-Verhalten): ${data.visitsUnclear}`);
+          }
           if (typeof data.visitsBots === 'number') {
             summary.push(`· Bots: ${data.visitsBots}`);
           }
